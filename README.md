@@ -7,5 +7,5 @@ https://github.com/Tetratrio/stylegan2_pytorch
 https://github.com/NVlabs/stylegan2
 ```
 
-p.s. Maybe this implement has some problems.
+p.s. Maybe this implementation has some problems.
 
