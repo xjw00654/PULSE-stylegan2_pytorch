@@ -7,6 +7,9 @@ from torch.nn import functional as F
 from . import models, utils
 from .external_models import lpips
 
+from SphericalOptimizer import SphericalOptimizer
+from loss import LossBuilder 
+
 
 class Projector(nn.Module):
     """
@@ -169,7 +172,8 @@ class Projector(nn.Module):
               noise_ramp_length=0.75,
               regularize_noise_weight=1e5,
               verbose=True,
-              verbose_prefix=''):
+              verbose_prefix='',
+              noise_layers=5):
         """
         Set up a target and its projection parameters.
         Arguments:
@@ -196,12 +200,20 @@ class Projector(nn.Module):
         target = target.to(self._dlatent_avg)
         target_scaled = self._scale_for_lpips(target)
 
-        dlatent_param = nn.Parameter(
-            self._dlatent_avg.clone().repeat(target.size(0), len(self.G_synthesis), 1))
+        dlatent_param = nn.Parameter(self._dlatent_avg.clone().repeat(target.size(0), len(self.G_synthesis), 1))
         noise_params = self.G_synthesis.static_noise(trainable=True)
+        for i_n, n in enumerate(noise_params):
+            if i_n > noise_layers:
+                # n.grad_fn = None
+                n.requires_grad = True
         params = [dlatent_param] + noise_params
+        # opt = torch.optim.Adam(params)
+        opt = SphericalOptimizer(torch..optim.Adam, params, lr=initial_learning_rate)
+        schedule_func = lambda x: (9 * (1 - np.abs(x / (0.9 * num_steps) - 1 / 2) * 2) + 1) / 10 
+                if x < 0.9 * num_steps else 1/10 + (x - 0.9 * num_steps) / (0.1 * num_steps) * (1 / 1000 - 1 / 10)
 
-        opt = torch.optim.Adam(params)
+        loss_builder = LossBuilder(target, "100*L2+0.1*GEOCROSS", 1e-3).cuda()
+        scheduler = torch.optim.lr_scheduler.LambdaLR(opt.opt, schedule_func)
 
         noise_tensor = torch.empty_like(dlatent_param)
 
@@ -211,6 +223,9 @@ class Projector(nn.Module):
 
         self._job = utils.AttributeDict(**locals())
         self._job.current_step = 0
+        self._job.min_loss = np.inf
+        self._job.min_l2 = np.inf
+        self._job.best_output = None
 
     def step(self, steps=1):
         """
@@ -245,60 +260,76 @@ class Projector(nn.Module):
             t = self._job.current_step / self._job.num_steps
             noise_strength = self._dlatent_std * self._job.initial_noise_factor \
                              * max(0.0, 1.0 - t / self._job.noise_ramp_length) ** 2
-            lr_ramp = min(1.0, (1.0 - t) / self._job.lr_rampdown_length)
-            lr_ramp = 0.5 - 0.5 * np.cos(lr_ramp * np.pi)
-            lr_ramp = lr_ramp * min(1.0, t / self._job.lr_rampup_length)
-            learning_rate = self._job.initial_learning_rate * lr_ramp
 
-            for param_group in self._job.opt.param_groups:
-                param_group['lr'] = learning_rate
+            # lr_ramp = min(1.0, (1.0 - t) / self._job.lr_rampdown_length)
+            # lr_ramp = 0.5 - 0.5 * np.cos(lr_ramp * np.pi)
+            # lr_ramp = lr_ramp * min(1.0, t / self._job.lr_rampup_length)
+            # learning_rate = self._job.initial_learning_rate * lr_ramp
+
+            # for param_group in self._job.opt.param_groups:
+            #     param_group['lr'] = learning_rate
 
             dlatents = self._job.dlatent_param + noise_strength * self._job.noise_tensor.normal_()
 
             output = self.G_synthesis(dlatents)
-            assert output.size() == self._job.target.size(), \
-                'target size {} does not fit output size {} of generator'.format(
-                    target.size(), output.size())
+            # assert output.size() == self._job.target.size(), \
+            #     'target size {} does not fit output size {} of generator'.format(
+            #         target.size(), output.size())
 
-            output_scaled = self._scale_for_lpips(output)
-
-            # Main loss: LPIPS distance of output and target
-            lpips_distance = torch.mean(self.lpips_model(output_scaled, self._job.target_scaled))
-
-            # Calculate noise regularization loss
-            reg_loss = 0
-            for p in self._job.noise_params:
-                size = min(p.size()[2:])
-                dim = p.dim() - 2
-                while True:
-                    reg_loss += torch.mean(
-                        (p * p.roll(shifts=[1] * dim, dims=list(range(2, 2 + dim)))) ** 2)
-                    if size <= 8:
-                        break
-                    p = F.interpolate(p, scale_factor=0.5, mode='area')
-                    size = size // 2
-
-            # Combine loss, backward and update params
-            loss = lpips_distance + self._job.regularize_noise_weight * reg_loss
-            self._job.opt.zero_grad()
+            loss, loss_dict = self._job.loss_builde(dlatents, output)
+            if loss < self._job.min_loss:
+                self._job.min_loss = loss
+                self._job.best_output = output.clone()
+            
+            loss_l2 = loss_dict['L2']
+            if loss_l2 < self._job.min_l2:
+                self._job.min_l2 = loss_l2
+            
             loss.backward()
             self._job.opt.step()
+            self._job.opt.scheduler.step()
 
-            # Normalize noise values
-            for p in self._job.noise_params:
-                with torch.no_grad():
-                    p_mean = p.mean(dim=list(range(1, p.dim())), keepdim=True)
-                    p_rstd = torch.rsqrt(
-                        torch.mean((p - p_mean) ** 2, dim=list(range(1, p.dim())), keepdim=True) + 1e-8)
-                    p.data = (p.data - p_mean) * p_rstd
+            # output_scaled = self._scale_for_lpips(output)
+
+            # # Main loss: LPIPS distance of output and target
+            # lpips_distance = torch.mean(self.lpips_model(output_scaled, self._job.target_scaled))
+
+            # # Calculate noise regularization loss
+            # reg_loss = 0
+            # for p in self._job.noise_params:
+            #     size = min(p.size()[2:])
+            #     dim = p.dim() - 2
+            #     while True:
+            #         reg_loss += torch.mean(
+            #             (p * p.roll(shifts=[1] * dim, dims=list(range(2, 2 + dim)))) ** 2)
+            #         if size <= 8:
+            #             break
+            #         p = F.interpolate(p, scale_factor=0.5, mode='area')
+            #         size = size // 2
+
+            # # Combine loss, backward and update params
+            # loss = lpips_distance + self._job.regularize_noise_weight * reg_loss
+            # self._job.opt.zero_grad()
+            # loss.backward()
+            # self._job.opt.step()
+
+            # # Normalize noise values
+            # for p in self._job.noise_params:
+            #     with torch.no_grad():
+            #         p_mean = p.mean(dim=list(range(1, p.dim())), keepdim=True)
+            #         p_rstd = torch.rsqrt(
+            #             torch.mean((p - p_mean) ** 2, dim=list(range(1, p.dim())), keepdim=True) + 1e-8)
+            #         p.data = (p.data - p_mean) * p_rstd
 
             self._job.current_step += 1
 
             if self._job.verbose:
                 self._job.value_tracker.add('loss', float(loss))
-                self._job.value_tracker.add('lpips_distance', float(lpips_distance))
-                self._job.value_tracker.add('noise_reg', float(reg_loss))
-                self._job.value_tracker.add('lr', learning_rate, beta=0)
+                # self._job.value_tracker.add('lpips_distance', float(lpips_distance))
+                # self._job.value_tracker.add('noise_reg', float(reg_loss))
+                # self._job.value_tracker.add('lr', learning_rate, beta=0)
                 self._job.progress.write(self._job.verbose_prefix, str(self._job.value_tracker))
                 if self._job.current_step >= self._job.num_steps:
                     self._job.progress.close()
+
+        return output, loss_dict, self._job.best_output

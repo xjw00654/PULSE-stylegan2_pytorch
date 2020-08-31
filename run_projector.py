@@ -26,6 +26,7 @@ _examples = """examples:
 
 """
 
+SAVE_PER = 500
 #----------------------------------------------------------------------------
 
 def _add_shared_arguments(parser):
@@ -268,22 +269,34 @@ def project_images(G, images, name_prefix, args):
             regularize_noise_weight=args.regularize_noise_weight,
             verbose=True,
             verbose_prefix='Projecting image(s) {}/{}'.format(
-                i * args.batch_size + len(target), len(images))
+                i * args.batch_size + len(target), len(images)),
+            noise_layers=5
         )
-        snapshot_steps = set(
-            args.num_steps - np.linspace(
-                0, args.num_steps, args.num_snapshots, endpoint=False, dtype=int))
-        for k, image in enumerate(
-        utils.tensor_to_PIL(target, pixel_min=args.pixel_min, pixel_max=args.pixel_max)):
-            image.save(os.path.join(args.output, name_prefix[i + k] + 'target.png'))
+        # snapshot_steps = set(
+        #     args.num_steps - np.linspace(
+        #         0, args.num_steps, args.num_snapshots, endpoint=False, dtype=int))
+        for k, image in enumerate(utils.tensor_to_PIL(target, pixel_min=args.pixel_min, pixel_max=args.pixel_max)):
+            os.makedirs(os.path.join(args.output, 'target+BEST'), exist_ok=True)
+            image.save(os.path.join(args.output, 'target+BEST', name_prefix[i + k] + 'target.png'))
         for j in range(args.num_steps):
-            proj.step()
-            if j in snapshot_steps:
-                generated = utils.tensor_to_PIL(
-                    proj.generate(), pixel_min=args.pixel_min, pixel_max=args.pixel_max)
-                for k, image in enumerate(generated):
-                    image.save(os.path.join(
-                        args.output, name_prefix[i + k] + 'step%04d.png' % (j + 1)))
+            current_image, loss_dict_step, best_output = proj.step()
+            # if j in snapshot_steps:
+            #     generated = utils.tensor_to_PIL(
+            #         proj.generate(), pixel_min=args.pixel_min, pixel_max=args.pixel_max)
+            #     for k, image in enumerate(generated):
+            #         image.save(os.path.join(
+            #             args.output, name_prefix[i + k] + 'step%04d.png' % (j + 1)))
+            current_image = utils.tensor_to_PIL(current_image, pixel_min=args.pixel_min, pixel_max=args.pixel_max)
+            best_output = utils.tensor_to_PIL(best_output, pixel_min=args.pixel_min, pixel_max=args.pixel_min)
+            for j % SAVE_PER == 0 and j != 0 or j == args.num_steps -1:
+                for k, (image, best_image) in enumerate(zip(current_image, best_output)):
+                    L2, GEOCROSS = loss_dict_stepp['L2'], loss_dict_stepp['GEOCROSS']
+                    save_name = f'{name_prefix[i + k]}-loss-{L2:.2f}+GEOCROSS-{GEOCROSS:.2f}-{j}.png'
+                    if j != args.num_steps - 1:
+                        image.save(os.path.join(args.output, save_name))
+                    else:
+                        save_name = f'{name_prefix[i + k]}-BEST-{j}.png'
+                        best_image.save(os.path.join(args.output, 'target+BEST', save_name))
 
 #----------------------------------------------------------------------------
 
